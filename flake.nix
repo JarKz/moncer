@@ -81,7 +81,9 @@
             mkDevShell = (
               rustToolchain:
               pkgs.mkShell {
-                packages = [];
+                packages = with pkgs; [
+                  sea-orm-cli
+                ];
 
                 buildInputsWith = buildInputsWith [ rustToolchain ];
                 nativeBuildInputs = nativeBuildInputsWith [ rustToolchain ];
