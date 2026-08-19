@@ -1824,6 +1824,7 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "chrono",
+ "derive_more",
  "entity",
  "rusty-money",
  "sea-orm",
