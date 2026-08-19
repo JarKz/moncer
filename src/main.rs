@@ -7,14 +7,14 @@ use actix_web::{
 use entity::{category, transaction};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    QueryFilter,
+    QueryFilter, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct CreateTransactionRequest {
     change_minor: i64,
-    category: Option<String>,
+    category_path: Option<Vec<String>>,
     reason: Option<String>,
     created_at_ms: Option<i64>,
 }
@@ -74,6 +74,13 @@ enum ErrorCode {
     DatabaseError,
 }
 
+fn standard_db_error() -> HttpResponse {
+    HttpResponse::InternalServerError().json(ErrorMessage {
+        error: ErrorCode::DatabaseError,
+        message: "Failed to perform an operation. Try again later.".to_owned(),
+    })
+}
+
 fn validate_change(change_minor: i64) -> Result<(), HttpResponse> {
     if change_minor == 0 {
         return Err(HttpResponse::UnprocessableEntity().json(ErrorMessage {
@@ -107,41 +114,56 @@ fn validate_timestamp(timestamp_ms: i64) -> Result<chrono::DateTime<chrono::Utc>
         .expect("The \"created_at_ms\" timestamp in must be valid"))
 }
 
-async fn find_category_by_name(
-    category_name: &str,
+async fn find_category_by_path(
+    category_path: &[String],
     database: &DatabaseConnection,
-) -> Result<category::Model, HttpResponse> {
-    let Ok(result) = category::Entity::find()
-        .filter(category::Column::Name.eq(category_name))
-        .one(database)
-        .await
-    else {
-        return Err(HttpResponse::InternalServerError().json(ErrorMessage {
-            error: ErrorCode::DatabaseError,
-            message: "Failed to make an operation. Try again later.".to_owned(),
-        }));
-    };
+) -> Result<Vec<category::Model>, HttpResponse> {
+    let mut parent_id = None;
+    let mut actual_category_path: Vec<category::Model> = Vec::with_capacity(category_path.len());
 
-    result.ok_or(HttpResponse::NotFound().json(ErrorMessage {
-        error: ErrorCode::CategoryNotFound,
-        message: format!("Cannot find an category with name \"{category_name}\"."),
-    }))
+    for category_name in category_path.iter().map(|name| name.trim()) {
+        let parent_condition = match parent_id {
+            Some(parent_id) => category::Column::ParentCategoryId.eq(parent_id),
+            None => category::Column::ParentCategoryId.is_null(),
+        };
+
+        let category_model = category::Entity::find()
+            .filter(parent_condition)
+            .filter(category::Column::Name.eq(category_name))
+            .one(database)
+            .await
+            .map_err(|_| standard_db_error())?;
+
+        let model = match category_model {
+            Some(model) => model,
+            None => {
+                return Err(HttpResponse::NotFound().json(ErrorMessage {
+                    error: ErrorCode::CategoryNotFound,
+                    message: format!("Cannot find an category with name \"{category_name}\"."),
+                }));
+            }
+        };
+
+        parent_id = Some(model.id);
+        actual_category_path.push(model);
+    }
+
+    Ok(actual_category_path)
 }
 
 async fn write_transaction(
     transaction_data: TransactionData,
     database: &DatabaseConnection,
 ) -> Result<transaction::Model, HttpResponse> {
-    match transaction::ActiveModel::from(transaction_data)
+    transaction::ActiveModel::from(transaction_data)
         .insert(database)
         .await
-    {
-        Ok(model) => Ok(model),
-        Err(_) => Err(HttpResponse::InternalServerError().json(ErrorMessage {
-            error: ErrorCode::DatabaseError,
-            message: "Failed to add a transaction. Try again later.".to_owned(),
-        })),
-    }
+        .map_err(|_| {
+            HttpResponse::InternalServerError().json(ErrorMessage {
+                error: ErrorCode::DatabaseError,
+                message: "Failed to add a transaction. Try again later.".to_owned(),
+            })
+        })
 }
 
 #[post("/transaction")]
@@ -161,11 +183,20 @@ async fn add_transaction(
         None => chrono::Utc::now(),
     };
 
-    let category_id = match &body.category {
-        Some(category_name) => match find_category_by_name(category_name, &database).await {
-            Ok(category) => Some(category.id),
-            Err(e) => return e,
-        },
+    let category_id = match &body.category_path {
+        Some(category_path) => {
+            if category_path.is_empty() || category_path.iter().any(|name| name.trim().is_empty()) {
+                return HttpResponse::UnprocessableEntity().json(ErrorMessage {
+                    error: ErrorCode::ValidationFailed,
+                    message: "The category path cannot be empty.".to_owned(),
+                });
+            }
+
+            match find_category_by_path(category_path, &database).await {
+                Ok(categories) => categories.last().map(|category| category.id),
+                Err(e) => return e,
+            }
+        }
         None => None,
     };
 
@@ -185,6 +216,95 @@ async fn add_transaction(
     };
 
     HttpResponse::Created().json(TransactionResponse::from(transaction))
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct CreateCategoryRequest {
+    category_path: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CategoryResponse {
+    id: i64,
+    name: String,
+    parent_category_id: Option<i64>,
+}
+
+impl From<category::Model> for CategoryResponse {
+    fn from(value: category::Model) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            parent_category_id: value.parent_category_id,
+        }
+    }
+}
+
+async fn ensure_category_path_exists(
+    category_path: &[String],
+    database: &DatabaseConnection,
+) -> Result<Vec<CategoryResponse>, HttpResponse> {
+    let mut parent_id = None;
+    let mut response_category_path: Vec<CategoryResponse> = Vec::with_capacity(category_path.len());
+
+    let txn = database.begin().await.map_err(|_| standard_db_error())?;
+
+    for category_name in category_path.iter().map(|name| name.trim()) {
+        let parent_condition = match parent_id {
+            Some(parent_id) => category::Column::ParentCategoryId.eq(parent_id),
+            None => category::Column::ParentCategoryId.is_null(),
+        };
+
+        let category_model = category::Entity::find()
+            .filter(parent_condition)
+            .filter(category::Column::Name.eq(category_name))
+            .one(&txn)
+            .await
+            .map_err(|_| standard_db_error())?;
+
+        let model = match category_model {
+            Some(model) => model,
+            None => {
+                use sea_orm::ActiveValue::*;
+
+                category::ActiveModel {
+                    id: NotSet,
+                    name: Set(category_name.to_owned()),
+                    parent_category_id: Set(parent_id),
+                }
+                .insert(&txn)
+                .await
+                .map_err(|_| standard_db_error())?
+            }
+        };
+
+        parent_id = Some(model.id);
+        response_category_path.push(model.into());
+    }
+
+    txn.commit().await.map_err(|_| standard_db_error())?;
+
+    Ok(response_category_path)
+}
+
+#[post("/category")]
+async fn add_category(
+    body: Json<CreateCategoryRequest>,
+    database: web::Data<DatabaseConnection>,
+) -> impl Responder {
+    if body.category_path.is_empty() || body.category_path.iter().any(|name| name.trim().is_empty())
+    {
+        return HttpResponse::UnprocessableEntity().json(ErrorMessage {
+            error: ErrorCode::ValidationFailed,
+            message: "The category path cannot be empty.".to_owned(),
+        });
+    }
+
+    match ensure_category_path_exists(&body.category_path, &database).await {
+        Ok(response) => HttpResponse::Ok().json(response),
+        Err(e) => e,
+    }
 }
 
 #[get("/")]
@@ -223,8 +343,7 @@ async fn main() -> std::io::Result<()> {
         .connect_timeout(Duration::from_secs(8))
         .acquire_timeout(Duration::from_secs(8))
         .idle_timeout(Duration::from_secs(8))
-        .max_lifetime(Duration::from_secs(8))
-        .set_schema_search_path("my_schema");
+        .max_lifetime(Duration::from_secs(8));
 
     let database = web::Data::new(
         Database::connect(opt)
@@ -236,7 +355,8 @@ async fn main() -> std::io::Result<()> {
         App::new().service(hello).service(
             web::scope("/api")
                 .app_data(database.clone())
-                .service(add_transaction),
+                .service(add_transaction)
+                .service(add_category),
         )
     })
     .bind((host_url, host_port))?

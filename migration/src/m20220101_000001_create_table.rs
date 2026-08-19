@@ -27,6 +27,31 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("uk_category_parent_name")
+                    .table("category")
+                    .col("parent_category_id")
+                    .col("name")
+                    .and_where(Expr::col(("category", "parent_category_id")).is_not_null())
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uk_category_root_name")
+                    .table("category")
+                    .col("name")
+                    .and_where(Expr::col(("category", "parent_category_id")).is_null())
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("transaction")
@@ -52,6 +77,14 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table("transaction").to_owned())
+            .await?;
+
+        manager
+            .drop_index(Index::drop().name("uk_category_parent_name").to_owned())
+            .await?;
+
+        manager
+            .drop_index(Index::drop().name("uk_category_root_name").to_owned())
             .await?;
 
         manager
