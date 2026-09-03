@@ -1,15 +1,20 @@
 use std::time::Duration;
 
 use actix_web::{
-    App, HttpResponse, HttpServer, Responder, get, post,
+    App, HttpResponse, HttpServer, Responder, post,
     web::{self, Json},
 };
 use entity::{category, transaction};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, TransactionTrait, raw_sql,
 };
 use serde::{Deserialize, Serialize};
+
+fn valid_timestamp_start() -> i64 {
+    // TODO: it can be controlled by configuration value.
+    0
+}
 
 #[derive(Deserialize)]
 struct CreateTransactionRequest {
@@ -146,7 +151,7 @@ fn validate_timestamp(
     /// It was made for avoiding a possible time difference between client and server sides.
     const MAX_FUTURE_SKEW: i64 = 5 * 60 * 1000;
 
-    if timestamp_ms < 0 {
+    if timestamp_ms < valid_timestamp_start() {
         return Err(ApplicationError::ValidationFailed {
             message: "The \"created_at_ms\" field cannot be below 0.".to_owned(),
         });
@@ -262,13 +267,40 @@ async fn add_transaction(
 }
 
 #[derive(Deserialize)]
-struct TransactionFilter {
+struct RequestTransactionFilter {
+    /// Filter transactions by the period starts with.
+    ///
+    /// Inclusive.
     created_since_ms: Option<i64>,
-    created_after_ms: Option<i64>,
 
+    /// Filter transactions by the period ends with.
+    ///
+    /// Exclusive.
+    created_before_ms: Option<i64>,
+
+    /// Filter transactions by the category.
     category_path: Option<Vec<String>>,
 
+    /// Whether to exclude subcategories of a selected category.
     #[serde(default)]
+    exclude_subcategories: bool,
+
+    /// Pick N elements from the result list.
+    limit: Option<u64>,
+
+    /// Skip N elements from the result list.
+    offset: Option<u64>,
+}
+
+struct TransactionFilter {
+    /// Inclusive.
+    created_since: chrono::DateTime<chrono::Utc>,
+
+    /// Exclusive.
+    created_before: chrono::DateTime<chrono::Utc>,
+
+    category_id: Option<i64>,
+
     exclude_subcategories: bool,
 
     limit: Option<u64>,
@@ -277,12 +309,126 @@ struct TransactionFilter {
 
 #[post("/transaction/search")]
 async fn find_transaction(
-    filter: Json<TransactionFilter>,
+    filter: Json<RequestTransactionFilter>,
     database: web::Data<DatabaseConnection>,
 ) -> impl Responder {
-    todo!();
+    let created_since = match filter.created_since_ms {
+        Some(timestamp) => match validate_timestamp(timestamp) {
+            Ok(time) => time,
+            Err(e) => return HttpResponse::from(e),
+        },
+        None => chrono::DateTime::from_timestamp_millis(valid_timestamp_start()).unwrap(),
+    };
 
-    HttpResponse::Ok()
+    let created_before = match filter.created_before_ms {
+        Some(timestamp) => match validate_timestamp(timestamp) {
+            Ok(time) => time,
+            Err(e) => return HttpResponse::from(e),
+        },
+        None => chrono::Utc::now(),
+    };
+
+    if created_since > created_before {
+        return HttpResponse::from(ApplicationError::ValidationFailed {
+            message: "Selected an invalid period.".to_owned(),
+        });
+    }
+
+    let category_id = match &filter.category_path {
+        Some(category_path) => {
+            if category_path.is_empty() || category_path.iter().any(|name| name.trim().is_empty()) {
+                return HttpResponse::from(ApplicationError::ValidationFailed {
+                    message: "The category path cannot be empty.".to_owned(),
+                });
+            }
+
+            match find_category_by_path(category_path, &database).await {
+                Ok(model) => model.last().map(|category| category.id),
+                Err(e) => return HttpResponse::from(e),
+            }
+        }
+        None => None,
+    };
+
+    let transactions = match find_transactions(
+        TransactionFilter {
+            created_since,
+            created_before,
+            category_id,
+            exclude_subcategories: filter.exclude_subcategories,
+            limit: filter.limit,
+            offset: filter.offset,
+        },
+        &database,
+    )
+    .await
+    {
+        Ok(models) => models
+            .into_iter()
+            .map(TransactionResponse::from)
+            .collect::<Vec<_>>(),
+        Err(e) => return HttpResponse::from(e),
+    };
+
+    HttpResponse::Ok().json(transactions)
+}
+
+async fn find_transactions(
+    filter: TransactionFilter,
+    database: &DatabaseConnection,
+) -> Result<Vec<transaction::Model>, ApplicationError> {
+    let suitable_categories = match filter.category_id {
+        Some(category_id) if !filter.exclude_subcategories => {
+            Some(resolve_category_subtree(category_id, database).await?)
+        }
+        Some(category_id) => Some(vec![category_id]),
+        None => None,
+    };
+
+    let mut select_query = transaction::Entity::find()
+        .filter(transaction::Column::CreatedAt.gte(filter.created_since))
+        .filter(transaction::Column::CreatedAt.lt(filter.created_before));
+
+    if let Some(categories) = suitable_categories {
+        select_query = select_query.filter(transaction::Column::CategoryId.is_in(categories));
+    }
+
+    if let Some(limit) = filter.limit {
+        select_query = select_query
+            .limit(limit)
+            .order_by_desc(transaction::Column::CreatedAt);
+    }
+
+    if let Some(offset) = filter.offset {
+        select_query = select_query.offset(offset);
+    }
+
+    select_query
+        .all(database)
+        .await
+        .map_err(|_| ApplicationError::GenericDatabaseError)
+}
+
+async fn resolve_category_subtree(
+    root_category_id: i64,
+    database: &DatabaseConnection,
+) -> Result<Vec<i64>, ApplicationError> {
+    category::Entity::find()
+        .from_raw_sql(raw_sql!(
+            Sqlite,
+            r#"WITH RECURSIVE category_tree (id) AS (
+                SELECT id FROM category WHERE id = {root_category_id}
+
+                UNION ALL
+
+                SELECT c.id FROM category c JOIN category_tree ct ON c.parent_category_id = ct.id
+            )
+            SELECT id FROM category_tree;"#
+        ))
+        .all(database)
+        .await
+        .map(|models| models.into_iter().map(|model| model.id).collect())
+        .map_err(|_| ApplicationError::GenericDatabaseError)
 }
 
 #[derive(Deserialize)]
