@@ -1,0 +1,9 @@
+[package]
+name = "repository"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sea-orm.workspace = true
+chrono.workspace = true
+shared.workspace = true

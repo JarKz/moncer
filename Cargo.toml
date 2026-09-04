@@ -4,14 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = [ ".", "migration", "entity" ]
+members = [
+    ".",
+    "shared",
+    "migration",
+    "repository"
+]
+
+[workspace.dependencies]
+chrono = "0.4.45"
+sea-orm = { version = "2.0", features = [ "sqlx-sqlite", "runtime-tokio-rustls" ] }
+derive_more = { version = "2.1.1", features = ["display"] }
+shared = { path = "./shared" }
+actix-web = "4.14.1"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dependencies]
-actix-web = "4.14.1"
-chrono = "0.4.45"
-derive_more = { version = "2.1.1", features = ["display"] }
-entity = { path = "./entity" }
+chrono.workspace = true
+sea-orm.workspace = true
+shared.workspace = true
+actix-web.workspace = true
+serde.workspace = true
+
+repository = { path = "./repository" }
+
 rusty-money = "0.5.0"
-sea-orm = { version = "2.0", features = [ "sqlx-sqlite", "runtime-tokio-rustls" ] }
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
